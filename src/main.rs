@@ -9,12 +9,12 @@ mod terminal;
 mod ui;
 
 use std::{
-    io::{self, IsTerminal},
+    io::{self, IsTerminal, Write},
     path::PathBuf,
     time::Duration,
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use app::{Action, App};
 use auth::AuthFlow;
 use config::Config;
@@ -27,34 +27,137 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("--install-protocol") {
-        protocol::install()?;
+    let mut arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+    {
+        print_help();
         return Ok(());
     }
+    let config_dir = take_config_dir(&mut arguments)?;
 
-    if let Some((uri, config_dir)) = callback_argument()? {
-        let config = match config_dir {
-            Some(dir) => Config::load_at_dir(dir)?,
-            None => Config::load()?,
+    if let [command, uri, flag, dir] = arguments.as_slice() {
+        if command == "--callback" && flag == "--config-dir" {
+            return receive_callback(uri, Config::load_at_dir(PathBuf::from(dir))?);
+        }
+    }
+
+    match arguments.as_slice() {
+        [] => run_tui(false, None, load_config(config_dir)?),
+        [command] if command == "--install-protocol" => {
+            protocol::install(&load_config(config_dir)?)
+        }
+        [group, action] if group == "auth" && action == "login" => {
+            run_tui(true, None, load_config(config_dir)?)
+        }
+        [group, action, flag, name]
+            if group == "auth" && action == "login" && flag == "--device-name" =>
+        {
+            run_tui(true, Some(name.clone()), load_config(config_dir)?)
+        }
+        [group, action] if group == "auth" && action == "logout" => {
+            run_auth_logout(load_config(config_dir)?)
+        }
+        [uri] if uri.starts_with("devnull://") => receive_callback(uri, load_config(config_dir)?),
+        [command, uri] if command == "--callback" => {
+            receive_callback(uri, load_config(config_dir)?)
+        }
+        [command, ..] if command == "--callback" => {
+            bail!("usage: stdout --callback <uri> [--config-dir <path>]")
+        }
+        _ => bail!("unknown command; run `stdout --help` for usage"),
+    }
+}
+
+fn take_config_dir(arguments: &mut Vec<String>) -> Result<Option<PathBuf>> {
+    let mut config_dir = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        if arguments[index] != "--config" {
+            index += 1;
+            continue;
+        }
+        if config_dir.is_some() {
+            bail!("--config may only be specified once");
+        }
+        let Some(path) = arguments.get(index + 1) else {
+            bail!("--config requires a directory path");
         };
-        auth::receive_callback_for_running_tui(&config, &uri)?;
-        return Ok(());
+        let path = PathBuf::from(path);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        arguments.drain(index..=index + 1);
+        config_dir = Some(path);
     }
+    Ok(config_dir)
+}
 
+fn load_config(config_dir: Option<PathBuf>) -> Result<Config> {
+    match config_dir {
+        Some(dir) => Config::load_at_dir(dir),
+        None => Config::load(),
+    }
+}
+
+fn receive_callback(uri: &str, config: Config) -> Result<()> {
+    auth::receive_callback_for_running_tui(&config, uri)
+}
+
+fn run_tui(start_login: bool, device_name: Option<String>, config: Config) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        anyhow::bail!("an interactive terminal is required");
+        bail!("an interactive terminal is required");
     }
 
-    let config = Config::load()?;
+    let protocol_warning = protocol::ensure_installed(&config).err().map(|error| {
+        format!("Could not register callback handler: {error}. Paste the URI manually.")
+    });
     let had_device_key = AuthFlow::has_device_key(&config);
     let mut auth = AuthFlow::new(config)?;
     let mut app = App::default();
-    let mut username = None;
+    if let Some(warning) = protocol_warning {
+        app.set_message(Some(warning));
+    }
+    let mut identity = None;
 
     if had_device_key {
         match auth.current_user() {
-            Ok(user) => username = user,
-            Err(error) => app.set_message(Some(format!("Could not verify device: {error}"))),
+            Ok(user) => identity = user,
+            Err(error) => {
+                app.set_message(Some(format!("Could not verify device with API: {error}")))
+            }
+        }
+    }
+    let mut username = identity.as_ref().map(|user| user.username.clone());
+
+    if start_login {
+        if let Some(user) = identity.as_ref() {
+            println!(
+                "Hi @{} ({}) [{}]",
+                user.username,
+                user.email.as_deref().unwrap_or("email unavailable"),
+                user.device_name
+            );
+            return Ok(());
+        }
+
+        let device_name = match device_name {
+            Some(name) => name,
+            None => prompt_device_name(auth.device_name())?,
+        };
+        match auth.set_device_name(device_name) {
+            Ok(()) => match webbrowser::open(auth.authorization_url()) {
+                Ok(()) if app.message().is_none() => app.set_message(Some(
+                    "Browser opened. Approve stdout, then return here if the callback does not arrive."
+                        .to_owned(),
+                )),
+                Ok(()) => {}
+                Err(error) => app.set_message(Some(format!("Could not open browser: {error}"))),
+            },
+            Err(error) => app.set_message(Some(format!("Could not start sign-in: {error}"))),
         }
     }
 
@@ -119,36 +222,95 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+fn prompt_device_name(default: &str) -> Result<String> {
+    eprint!("Device name [{default}]: ");
+    io::stderr().flush()?;
+
+    let mut name = String::new();
+    io::stdin().read_line(&mut name)?;
+    let name = name.trim();
+    Ok(if name.is_empty() {
+        default.to_owned()
+    } else {
+        name.to_owned()
+    })
+}
+
+fn run_auth_logout(config: Config) -> Result<()> {
+    let validation = if AuthFlow::has_device_key(&config) {
+        Some(
+            match AuthFlow::new(config.clone()).and_then(|auth| auth.current_user()) {
+                Ok(Some(user)) => format!("API validated the local key for {}.", user.username),
+                Ok(None) => "API reports that the local key is not approved.".to_owned(),
+                Err(error) => {
+                    format!("Could not validate the local key against the API: {error:#}")
+                }
+            },
+        )
+    } else {
+        None
+    };
+
+    let removed_key = auth::logout_local(&config)?;
+    if let Some(validation) = validation {
+        println!("{validation}");
+    }
+    if removed_key {
+        println!("Logged out locally. The server-side device remains approved; revoke it in dev-null.sh device settings.");
+    } else {
+        println!("No local device key. Any server-side device approval remains unchanged.");
+    }
+    Ok(())
+}
+
+fn print_help() {
+    println!(
+        "stdout — dev-null.sh terminal client\n\nUsage:\n  stdout [--config <dir>] [--help]\n  stdout [--config <dir>] auth login [--device-name <name>]\n  stdout [--config <dir>] auth logout\n\nCommands:\n  auth login   Show current user if authenticated; otherwise sign in\n               Prompts for a device name; --device-name skips the prompt\n  auth logout  Remove local credentials and cached identity (server approval remains)\n\nOptions:\n  --config <dir>       Use this config directory (config.toml and local credentials)\n  -h, --help           Show this help\n  --install-protocol   Re-register the devnull:// callback handler"
+    );
+}
+
 fn complete_callback(auth: &AuthFlow, uri: String, app: &mut App, username: &mut Option<String>) {
     match auth.complete_callback(&uri) {
-        Ok(name) => {
-            *username = Some(name);
+        Ok(identity) => {
+            *username = Some(identity.username);
             app.set_message(None);
         }
         Err(error) => app.set_message(Some(format!("Sign-in failed: {error:#}"))),
     }
 }
 
-fn callback_argument() -> Result<Option<(String, Option<PathBuf>)>> {
-    let mut arguments = std::env::args().skip(1);
-    let Some(first) = arguments.next() else {
-        return Ok(None);
-    };
+#[cfg(test)]
+mod tests {
+    use std::env;
 
-    if first == "--callback" {
-        let uri = arguments.next().context("--callback requires a URI")?;
-        let config_dir = match arguments.next() {
-            None => None,
-            Some(flag) if flag == "--config-dir" => Some(PathBuf::from(
-                arguments.next().context("--config-dir requires a path")?,
-            )),
-            Some(argument) => bail!("unexpected callback argument: {argument}"),
-        };
-        if arguments.next().is_some() {
-            bail!("unexpected argument after callback options");
-        }
-        return Ok(Some((uri, config_dir)));
+    use super::take_config_dir;
+
+    #[test]
+    fn config_option_works_after_a_subcommand_and_uses_absolute_path() {
+        let mut arguments = vec![
+            "auth".to_owned(),
+            "login".to_owned(),
+            "--config".to_owned(),
+            "custom-config".to_owned(),
+        ];
+
+        let config_dir = take_config_dir(&mut arguments).unwrap().unwrap();
+        assert_eq!(arguments, ["auth", "login"]);
+        assert_eq!(
+            config_dir,
+            env::current_dir().unwrap().join("custom-config")
+        );
     }
 
-    Ok(first.starts_with("devnull://").then_some((first, None)))
+    #[test]
+    fn config_option_requires_one_directory() {
+        assert!(take_config_dir(&mut vec!["--config".to_owned()]).is_err());
+        assert!(take_config_dir(&mut vec![
+            "--config".to_owned(),
+            "one".to_owned(),
+            "--config".to_owned(),
+            "two".to_owned(),
+        ])
+        .is_err());
+    }
 }

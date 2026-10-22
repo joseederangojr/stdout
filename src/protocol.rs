@@ -10,27 +10,54 @@ use std::{
     process::Command,
 };
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::config::Config;
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 use anyhow::Context;
 use anyhow::{bail, Result};
+#[cfg(target_os = "macos")]
+use std::os::raw::{c_char, c_void};
 
-pub fn install() -> Result<()> {
+pub fn install(config: &Config) -> Result<()> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        let executable = env::current_exe().context("could not locate stdout executable")?;
-        let config_dir = Config::load()?.dir;
-
-        #[cfg(target_os = "linux")]
-        return install_linux(&executable, &config_dir);
-
-        #[cfg(target_os = "macos")]
-        return install_macos(&executable, &config_dir);
+        install_for_current_process(config)
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     bail!("devnull:// protocol registration supports macOS and Linux");
+}
+
+pub fn ensure_installed(config: &Config) -> Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let executable = env::current_exe().context("could not locate stdout executable")?;
+        let marker = config.dir.join("protocol-handler");
+        let expected = format!("{}\n{}\n", executable.display(), config.dir.display());
+        if fs::read(&marker).is_ok_and(|installed| installed == expected.as_bytes()) {
+            return Ok(());
+        }
+        install_for_current_process(config)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = config;
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn install_for_current_process(config: &Config) -> Result<()> {
+    let executable = env::current_exe().context("could not locate stdout executable")?;
+
+    #[cfg(target_os = "linux")]
+    install_linux(&executable, &config.dir)?;
+
+    #[cfg(target_os = "macos")]
+    install_macos(&executable, &config.dir)?;
+
+    let expected = format!("{}\n{}\n", executable.display(), config.dir.display());
+    config.write_private(&config.dir.join("protocol-handler"), expected.as_bytes())
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -121,12 +148,17 @@ fn install_macos(executable: &Path, config_dir: &Path) -> Result<()> {
             "string",
             "sh.devnull.stdout-url-handler",
         )?;
+        set_plist(&plist, ":CFBundleName", "string", "stdout")?;
         set_plist(&plist, ":LSUIElement", "bool", "true")?;
         run_plist(&plist, "Add :CFBundleURLTypes array")?;
         run_plist(&plist, "Add :CFBundleURLTypes:0 dict")?;
         run_plist(
             &plist,
             "Add :CFBundleURLTypes:0:CFBundleURLName string devnull",
+        )?;
+        run_plist(
+            &plist,
+            "Add :CFBundleURLTypes:0:CFBundleTypeRole string Viewer",
         )?;
         run_plist(&plist, "Add :CFBundleURLTypes:0:CFBundleURLSchemes array")?;
         run_plist(
@@ -141,6 +173,7 @@ fn install_macos(executable: &Path, config_dir: &Path) -> Result<()> {
         let lsregister = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
         run(lsregister, &["-f", path_arg(&app)?])
             .context("could not register the macOS URL handler with Launch Services")?;
+        set_default_url_handler("sh.devnull.stdout-url-handler")?;
         Ok(())
     })();
 
@@ -191,6 +224,56 @@ fn run_plist(plist: &Path, command: &str) -> Result<()> {
 #[cfg(target_os = "macos")]
 fn path_arg(path: &Path) -> Result<&str> {
     path.to_str().context("path is not valid UTF-8")
+}
+
+#[cfg(target_os = "macos")]
+fn set_default_url_handler(bundle_identifier: &str) -> Result<()> {
+    use std::ffi::CString;
+
+    let scheme = CString::new("devnull")?;
+    let bundle_identifier = CString::new(bundle_identifier)?;
+    unsafe {
+        let scheme = CFStringCreateWithCString(std::ptr::null(), scheme.as_ptr(), 0x08000100);
+        let bundle_identifier =
+            CFStringCreateWithCString(std::ptr::null(), bundle_identifier.as_ptr(), 0x08000100);
+        if scheme.is_null() || bundle_identifier.is_null() {
+            if !scheme.is_null() {
+                CFRelease(scheme);
+            }
+            if !bundle_identifier.is_null() {
+                CFRelease(bundle_identifier);
+            }
+            bail!("could not create Launch Services strings");
+        }
+
+        let status = LSSetDefaultHandlerForURLScheme(scheme, bundle_identifier);
+        CFRelease(scheme);
+        CFRelease(bundle_identifier);
+        if status != 0 {
+            bail!("Launch Services could not set the devnull:// handler (status {status})");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFStringCreateWithCString(
+        allocator: *const c_void,
+        c_string: *const c_char,
+        encoding: u32,
+    ) -> *const c_void;
+    fn CFRelease(value: *const c_void);
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreServices", kind = "framework")]
+unsafe extern "C" {
+    fn LSSetDefaultHandlerForURLScheme(
+        scheme: *const c_void,
+        bundle_identifier: *const c_void,
+    ) -> i32;
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

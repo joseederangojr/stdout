@@ -12,6 +12,12 @@ use crate::device::DeviceKey;
 
 const SIGNATURE_NAMESPACE: &str = "devnull-api";
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentUser {
+    pub username: String,
+    pub email: Option<String>,
+}
+
 pub struct ApiClient {
     origin: Url,
     client: Client,
@@ -35,17 +41,14 @@ impl ApiClient {
         self.key.fingerprint()
     }
 
-    pub fn current_user(&self) -> Result<Option<String>> {
+    pub fn current_user(&self) -> Result<Option<CurrentUser>> {
         let url = self.origin.join("api/v1/me")?;
         let response = self.signed_request(Method::GET, url, &[])?;
         let (status, body) = response_body(response)?;
         let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
 
         if status.is_success() {
-            return payload["data"]["username"]
-                .as_str()
-                .map(|name| Some(name.to_owned()))
-                .context("API response did not include the current username");
+            return parse_current_user(&payload).map(Some);
         }
 
         if payload["code"] == "device_not_approved" {
@@ -55,7 +58,7 @@ impl ApiClient {
         Err(api_error(status, &payload))
     }
 
-    pub fn redeem_device(&self, code: &str, verifier: &str) -> Result<String> {
+    pub fn redeem_device(&self, code: &str, verifier: &str) -> Result<CurrentUser> {
         let url = self.origin.join("api/v1/devices")?;
         let body = serde_json::to_vec(&json!({
             "code": code,
@@ -69,10 +72,7 @@ impl ApiClient {
             return Err(api_error(status, &payload));
         }
 
-        payload["data"]["username"]
-            .as_str()
-            .map(str::to_owned)
-            .context("API response did not include the authenticated username")
+        parse_current_user(&payload)
     }
 
     fn signed_request(&self, method: Method, url: Url, body: &[u8]) -> Result<Response> {
@@ -99,6 +99,16 @@ impl ApiClient {
             .send()
             .context("requesting dev-null.sh API")
     }
+}
+
+fn parse_current_user(payload: &serde_json::Value) -> Result<CurrentUser> {
+    Ok(CurrentUser {
+        username: payload["data"]["username"]
+            .as_str()
+            .context("API response did not include the current username")?
+            .to_owned(),
+        email: payload["data"]["email"].as_str().map(str::to_owned),
+    })
 }
 
 fn canonical_message(
@@ -141,7 +151,25 @@ mod tests {
     use reqwest::Method;
     use url::Url;
 
-    use super::canonical_message;
+    use serde_json::json;
+
+    use super::{canonical_message, parse_current_user};
+
+    #[test]
+    fn parses_current_user_username_and_email() {
+        let user = parse_current_user(&json!({
+            "data": { "username": "octocat", "email": "octo@example.test" }
+        }))
+        .unwrap();
+        assert_eq!(user.username, "octocat");
+        assert_eq!(user.email.as_deref(), Some("octo@example.test"));
+    }
+
+    #[test]
+    fn parses_current_user_without_optional_email() {
+        let user = parse_current_user(&json!({"data": {"username": "octocat"}})).unwrap();
+        assert_eq!(user.email, None);
+    }
 
     #[test]
     fn signature_message_matches_server_contract() {

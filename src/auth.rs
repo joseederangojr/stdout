@@ -6,9 +6,20 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::{api::ApiClient, config::Config, device::DeviceKey};
+use crate::{
+    api::{ApiClient, CurrentUser},
+    config::Config,
+    device::DeviceKey,
+};
 
 const CALLBACK_URI: &str = "devnull://auth/callback";
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LocalIdentity {
+    pub username: String,
+    pub email: Option<String>,
+    pub device_name: String,
+}
 
 #[derive(Serialize, Deserialize)]
 struct PendingAuthorization {
@@ -27,10 +38,16 @@ pub struct AuthFlow {
     api: ApiClient,
     pending: PendingAuthorization,
     authorization_url: String,
+    device_name: String,
 }
 
 impl AuthFlow {
     pub fn new(config: Config) -> Result<Self> {
+        let device_name = validate_device_name(
+            load_local_identity(&config)?
+                .map(|identity| identity.device_name)
+                .unwrap_or_else(default_device_name),
+        )?;
         let key = DeviceKey::load_or_create(&config.dir)?;
         let api = ApiClient::new(config.api_origin.clone(), key)?;
         let pending_path = pending_path(&config);
@@ -41,13 +58,14 @@ impl AuthFlow {
             new_pending(&config)?
         };
         validate_pending(&pending)?;
-        let authorization_url = build_authorization_url(&config, &api, &pending)?;
+        let authorization_url = build_authorization_url(&config, &api, &pending, &device_name)?;
 
         Ok(Self {
             config,
             api,
             pending,
             authorization_url,
+            device_name,
         })
     }
 
@@ -55,8 +73,13 @@ impl AuthFlow {
         config.dir.join("device_ed25519").exists()
     }
 
-    pub fn current_user(&self) -> Result<Option<String>> {
-        self.api.current_user()
+    pub fn current_user(&self) -> Result<Option<LocalIdentity>> {
+        let Some(user) = self.api.current_user()? else {
+            return Ok(None);
+        };
+        let identity = local_identity(user, &self.device_name);
+        save_local_identity(&self.config, &identity)?;
+        Ok(Some(identity))
     }
 
     pub fn authorization_url(&self) -> &str {
@@ -67,9 +90,19 @@ impl AuthFlow {
         self.api.fingerprint()
     }
 
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
+    pub fn set_device_name(&mut self, name: String) -> Result<()> {
+        self.device_name = validate_device_name(name)?;
+        self.restart()
+    }
+
     pub fn restart(&mut self) -> Result<()> {
         let pending = make_pending()?;
-        let authorization_url = build_authorization_url(&self.config, &self.api, &pending)?;
+        let authorization_url =
+            build_authorization_url(&self.config, &self.api, &pending, &self.device_name)?;
         write_pending(&self.config, &pending)?;
         let _ = fs::remove_file(callback_path(&self.config));
         self.pending = pending;
@@ -77,17 +110,19 @@ impl AuthFlow {
         Ok(())
     }
 
-    pub fn complete_callback(&self, value: &str) -> Result<String> {
+    pub fn complete_callback(&self, value: &str) -> Result<LocalIdentity> {
         let callback = parse_callback(value)?;
         validate_callback(&callback, &self.pending)?;
         let code = callback
             .code
             .context("callback has no authorization code")?;
-        let username = self.api.redeem_device(&code, &self.pending.verifier)?;
+        let user = self.api.redeem_device(&code, &self.pending.verifier)?;
+        let identity = local_identity(user, &self.device_name);
+        save_local_identity(&self.config, &identity)?;
 
         let _ = fs::remove_file(pending_path(&self.config));
         let _ = fs::remove_file(callback_path(&self.config));
-        Ok(username)
+        Ok(identity)
     }
 
     pub fn take_received_callback(&self) -> Result<Option<String>> {
@@ -101,6 +136,50 @@ impl AuthFlow {
         fs::remove_file(path)?;
         Ok(Some(callback))
     }
+}
+
+pub fn logout_local(config: &Config) -> Result<bool> {
+    let private_key = config.dir.join("device_ed25519");
+    let had_key = private_key.exists();
+    for path in [
+        private_key,
+        config.dir.join("device_ed25519.pub"),
+        config.dir.join("identity.json"),
+        pending_path(config),
+        callback_path(config),
+    ] {
+        if let Err(error) = fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error).with_context(|| format!("removing {}", path.display()));
+            }
+        }
+    }
+    Ok(had_key)
+}
+
+fn local_identity(user: CurrentUser, device_name: &str) -> LocalIdentity {
+    LocalIdentity {
+        username: user.username,
+        email: user.email,
+        device_name: device_name.to_owned(),
+    }
+}
+
+fn save_local_identity(config: &Config, identity: &LocalIdentity) -> Result<()> {
+    config.write_private(
+        &config.dir.join("identity.json"),
+        &serde_json::to_vec(identity)?,
+    )
+}
+
+fn load_local_identity(config: &Config) -> Result<Option<LocalIdentity>> {
+    let path = config.dir.join("identity.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    serde_json::from_slice(&fs::read(&path)?)
+        .with_context(|| format!("parsing {}", path.display()))
+        .map(Some)
 }
 
 pub fn receive_callback_for_running_tui(config: &Config, value: &str) -> Result<()> {
@@ -157,13 +236,13 @@ fn build_authorization_url(
     config: &Config,
     api: &ApiClient,
     pending: &PendingAuthorization,
+    device_name: &str,
 ) -> Result<String> {
     let challenge = challenge_for(&pending.verifier);
-    let device_name = device_name();
     let mut url = config.api_origin.join("mobile/authorize")?;
     url.query_pairs_mut()
         .append_pair("fingerprint", api.fingerprint())
-        .append_pair("device_name", &device_name)
+        .append_pair("device_name", device_name)
         .append_pair("code_challenge", &challenge)
         .append_pair("code_challenge_method", "S256")
         .append_pair("state", &pending.state)
@@ -171,11 +250,20 @@ fn build_authorization_url(
     Ok(url.into())
 }
 
-fn device_name() -> String {
+pub fn default_device_name() -> String {
     let host = std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "computer".to_owned());
     format!("stdout on {}", host.chars().take(80).collect::<String>())
+}
+
+fn validate_device_name(name: String) -> Result<String> {
+    let name = name.trim();
+    let length = name.chars().count();
+    if length == 0 || length > 100 || name.chars().any(char::is_control) {
+        bail!("device name must be 1–100 characters without control characters");
+    }
+    Ok(name.to_owned())
 }
 
 fn parse_callback(value: &str) -> Result<Callback> {
@@ -254,13 +342,19 @@ fn callback_path(config: &Config) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        path::PathBuf,
+        process::Command,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use url::Url;
 
     use super::{
-        make_pending, parse_callback, receive_callback_for_running_tui, validate_callback,
-        write_pending,
+        load_local_identity, logout_local, make_pending, parse_callback,
+        receive_callback_for_running_tui, save_local_identity, validate_callback,
+        validate_device_name, write_pending, AuthFlow, LocalIdentity,
     };
     use crate::config::Config;
 
@@ -302,6 +396,89 @@ mod tests {
     }
 
     #[test]
+    fn local_logout_removes_key_and_pending_callback_files() {
+        let dir = test_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let config = Config {
+            api_origin: Url::parse("https://dev-null.sh/").unwrap(),
+            dir: dir.clone(),
+        };
+        for name in [
+            "device_ed25519",
+            "device_ed25519.pub",
+            "identity.json",
+            "pending-auth.json",
+            "auth-callback-uri",
+        ] {
+            fs::write(dir.join(name), b"test").unwrap();
+        }
+
+        assert!(logout_local(&config).unwrap());
+        assert!(!logout_local(&config).unwrap());
+        assert!(!dir.join("device_ed25519").exists());
+        assert!(!dir.join("device_ed25519.pub").exists());
+        assert!(!dir.join("identity.json").exists());
+        assert!(!dir.join("pending-auth.json").exists());
+        assert!(!dir.join("auth-callback-uri").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn local_identity_round_trips_through_private_storage() {
+        let dir = test_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let config = Config {
+            api_origin: Url::parse("https://dev-null.sh/").unwrap(),
+            dir: dir.clone(),
+        };
+        let identity = LocalIdentity {
+            username: "octocat".to_owned(),
+            email: Some("octo@example.test".to_owned()),
+            device_name: "Work Mac".to_owned(),
+        };
+
+        save_local_identity(&config, &identity).unwrap();
+        assert_eq!(load_local_identity(&config).unwrap(), Some(identity));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn custom_device_name_is_validated_and_sent_in_authorization_url() {
+        assert_eq!(
+            validate_device_name("  Work Mac  ".to_owned()).unwrap(),
+            "Work Mac"
+        );
+        assert!(validate_device_name("  ".to_owned()).is_err());
+        assert!(validate_device_name("a".repeat(101)).is_err());
+        assert!(validate_device_name("bad\nname".to_owned()).is_err());
+
+        if Command::new("ssh-keygen").arg("-?").output().is_err() {
+            return;
+        }
+
+        let dir = test_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let config = Config {
+            api_origin: Url::parse("http://localhost:8000/").unwrap(),
+            dir: dir.clone(),
+        };
+        let mut auth = AuthFlow::new(config).unwrap();
+        auth.set_device_name("Work Mac".to_owned()).unwrap();
+        for _ in 0..2 {
+            let url = Url::parse(auth.authorization_url()).unwrap();
+            assert_eq!(
+                url.query_pairs()
+                    .find(|(key, _)| key == "device_name")
+                    .unwrap()
+                    .1,
+                "Work Mac"
+            );
+            auth.restart().unwrap();
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn protocol_callback_is_persisted_only_for_the_pending_state() {
         use super::PendingAuthorization;
 
@@ -336,6 +513,11 @@ mod tests {
     }
 
     fn test_dir() -> PathBuf {
-        std::env::temp_dir().join(format!("stdout-auth-test-{}", std::process::id()))
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        std::env::temp_dir().join(format!(
+            "stdout-auth-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 }
