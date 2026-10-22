@@ -1,6 +1,7 @@
 mod api;
 mod app;
 mod auth;
+mod clipboard;
 mod config;
 mod device;
 mod event;
@@ -9,13 +10,13 @@ mod terminal;
 mod ui;
 
 use std::{
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal},
     path::PathBuf,
     time::Duration,
 };
 
 use anyhow::{bail, Result};
-use app::{Action, App, EnterAction};
+use app::{Action, App, EnterAction, Step};
 use auth::AuthFlow;
 use config::Config;
 
@@ -144,24 +145,9 @@ fn run_tui(start_login: bool, device_name: Option<String>, config: Config) -> Re
             );
             return Ok(());
         }
-
-        let device_name = match device_name {
-            Some(name) => name,
-            None => prompt_device_name(app.device_name_suggestion())?,
-        };
-        app.set_device_name_input(device_name);
-        match auth.set_device_name(app.device_name_input().to_owned()) {
-            Ok(()) => match webbrowser::open(auth.authorization_url()) {
-                Ok(()) if app.message().is_none() => app.set_message(Some(
-                    "Browser opened. Approve stdout, then return here if the callback does not arrive."
-                        .to_owned(),
-                )),
-                Ok(()) => {}
-                Err(error) => app.set_message(Some(format!("Could not open browser: {error}"))),
-            },
-            Err(error) => app.set_message(Some(format!("Could not start sign-in: {error}"))),
-        }
     }
+
+    apply_cli_device_name_prefill(&mut app, device_name);
 
     let mut terminal = terminal::TerminalSession::new()?;
     while !app.should_quit() {
@@ -206,6 +192,18 @@ fn run_tui(start_login: bool, device_name: Option<String>, config: Config) -> Re
                     Err(error) => app.set_message(Some(format!("Could not open browser: {error}"))),
                 }
             }
+            Action::CopyAuthorizationUrl
+                if username.is_none() && contextual_actions.copy_authorization_url =>
+            {
+                match clipboard::copy(auth.authorization_url()) {
+                    Ok(()) => {
+                        app.set_message(Some("Authorization URL copied to clipboard.".to_owned()))
+                    }
+                    Err(error) => {
+                        app.set_message(Some(format!("Could not copy URL to clipboard: {error}")))
+                    }
+                }
+            }
             Action::RestartAuthorization
                 if username.is_none() && contextual_actions.restart_authorization =>
             {
@@ -216,6 +214,24 @@ fn run_tui(start_login: bool, device_name: Option<String>, config: Config) -> Re
                     }
                 }
                 app.take_callback_input();
+            }
+            Action::ContinueStep
+                if username.is_none()
+                    && app.active_step() == Step::NameDevice
+                    && contextual_actions.enter == Some(EnterAction::Continue) =>
+            {
+                let device_name =
+                    device_name_to_submit(app.device_name_input(), app.device_name_suggestion());
+                match auth.set_device_name(device_name.clone()) {
+                    Ok(()) => {
+                        app.set_device_name_input(device_name);
+                        app.update(Action::ContinueStep);
+                        app.set_message(None);
+                    }
+                    Err(error) => {
+                        app.set_message(Some(format!("Could not start sign-in: {error}")))
+                    }
+                }
             }
             Action::SubmitCallback
                 if username.is_none()
@@ -237,18 +253,18 @@ fn run_tui(start_login: bool, device_name: Option<String>, config: Config) -> Re
     Ok(())
 }
 
-fn prompt_device_name(default: &str) -> Result<String> {
-    eprint!("Device name [{default}]: ");
-    io::stderr().flush()?;
+fn apply_cli_device_name_prefill(app: &mut App, device_name: Option<String>) {
+    if let Some(name) = device_name {
+        app.set_device_name_input(name);
+    }
+}
 
-    let mut name = String::new();
-    io::stdin().read_line(&mut name)?;
-    let name = name.trim();
-    Ok(if name.is_empty() {
-        default.to_owned()
+fn device_name_to_submit(input: &str, suggestion: &str) -> String {
+    if input.trim().is_empty() {
+        suggestion.to_owned()
     } else {
-        name.to_owned()
-    })
+        input.to_owned()
+    }
 }
 
 fn run_auth_logout(config: Config) -> Result<()> {
@@ -280,7 +296,7 @@ fn run_auth_logout(config: Config) -> Result<()> {
 
 fn print_help() {
     println!(
-        "stdout — dev-null.sh terminal client\n\nUsage:\n  stdout [--config <dir>] [--help]\n  stdout [--config <dir>] auth login [--device-name <name>]\n  stdout [--config <dir>] auth logout\n\nCommands:\n  auth login   Show current user if authenticated; otherwise sign in\n               Prompts for a device name; --device-name skips the prompt\n  auth logout  Remove local credentials and cached identity (server approval remains)\n\nOptions:\n  --config <dir>       Use this config directory (config.toml and local credentials)\n  -h, --help           Show this help\n  --install-protocol   Re-register the devnull:// callback handler"
+        "stdout — dev-null.sh terminal client\n\nUsage:\n  stdout [--config <dir>] [--help]\n  stdout [--config <dir>] auth login [--device-name <name>]\n  stdout [--config <dir>] auth logout\n\nCommands:\n  auth login   Show current user if authenticated; otherwise sign in\n               Opens sign-in TUI; --device-name pre-fills step 1\n  auth logout  Remove local credentials and cached identity (server approval remains)\n\nOptions:\n  --config <dir>       Use this config directory (config.toml and local credentials)\n  -h, --help           Show this help\n  --install-protocol   Re-register the devnull:// callback handler"
     );
 }
 
@@ -299,7 +315,7 @@ fn complete_callback(auth: &AuthFlow, uri: String, app: &mut App, username: &mut
 mod tests {
     use std::env;
 
-    use super::take_config_dir;
+    use super::{apply_cli_device_name_prefill, device_name_to_submit, take_config_dir, App};
 
     #[test]
     fn config_option_works_after_a_subcommand_and_uses_absolute_path() {
@@ -328,5 +344,28 @@ mod tests {
             "two".to_owned(),
         ])
         .is_err());
+    }
+
+    #[test]
+    fn device_name_submission_prefers_user_input_and_falls_back_to_suggestion() {
+        assert_eq!(
+            device_name_to_submit(" Work Mac ", "stdout on host"),
+            " Work Mac "
+        );
+        assert_eq!(
+            device_name_to_submit("   ", "stdout on host"),
+            "stdout on host"
+        );
+    }
+
+    #[test]
+    fn device_name_input_is_prefilled_only_from_cli_flag() {
+        let mut app = App::default();
+
+        apply_cli_device_name_prefill(&mut app, None);
+        assert_eq!(app.device_name_input(), "");
+
+        apply_cli_device_name_prefill(&mut app, Some("Work Mac".to_owned()));
+        assert_eq!(app.device_name_input(), "Work Mac");
     }
 }

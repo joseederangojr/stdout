@@ -119,6 +119,33 @@ mod tests {
             ),
             Some(Action::SetMode(Mode::Insert))
         );
+        assert_eq!(
+            action_from_key(
+                KeyCode::Char('o'),
+                KeyModifiers::NONE,
+                Mode::Normal,
+                Step::BrowserApproval
+            ),
+            Some(Action::OpenBrowser)
+        );
+        assert_eq!(
+            action_from_key(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+                Mode::Normal,
+                Step::BrowserApproval
+            ),
+            Some(Action::CopyAuthorizationUrl)
+        );
+        assert_eq!(
+            action_from_key(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+                Mode::Normal,
+                Step::NameDevice
+            ),
+            None
+        );
     }
 
     #[test]
