@@ -168,6 +168,12 @@ fn run_tui(start_login: bool, device_name: Option<String>, config: Config) -> Re
         let view = match username.as_deref() {
             Some(_) => ui::View::SignedIn,
             None => ui::View::SignIn {
+                active_step: app.active_step(),
+                mode: app.mode(),
+                name_device_complete: app.is_step_complete(app::Step::NameDevice),
+                browser_approval_complete: app.is_step_complete(app::Step::BrowserApproval),
+                device_name_input: app.device_name_input(),
+                device_name_suggestion: app.device_name_suggestion(),
                 authorization_url: auth.authorization_url(),
                 fingerprint: auth.fingerprint(),
                 callback_input: app.callback_input(),
@@ -281,6 +287,7 @@ fn print_help() {
 fn complete_callback(auth: &AuthFlow, uri: String, app: &mut App, username: &mut Option<String>) {
     match auth.complete_callback(&uri) {
         Ok(identity) => {
+            app.mark_browser_approval_complete();
             *username = Some(identity.username);
             app.set_message(None);
         }

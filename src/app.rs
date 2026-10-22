@@ -51,6 +51,8 @@ pub struct App {
     should_quit: bool,
     active_step: Step,
     mode: Mode,
+    name_device_complete: bool,
+    browser_approval_complete: bool,
     device_name_input: String,
     device_name_suggestion: String,
     callback_input: String,
@@ -63,6 +65,8 @@ impl Default for App {
             should_quit: false,
             active_step: Step::NameDevice,
             mode: Mode::Insert,
+            name_device_complete: false,
+            browser_approval_complete: false,
             device_name_input: String::new(),
             device_name_suggestion: String::new(),
             callback_input: String::new(),
@@ -92,6 +96,9 @@ impl App {
         match action {
             Action::Quit => self.should_quit = true,
             Action::ContinueStep => {
+                if self.active_step == Step::NameDevice {
+                    self.name_device_complete = true;
+                }
                 self.active_step = self.active_step.next();
                 self.mode = match self.active_step {
                     Step::BrowserApproval => Mode::Normal,
@@ -195,6 +202,18 @@ impl App {
 
     pub fn message(&self) -> Option<&str> {
         self.message.as_deref()
+    }
+
+    pub fn is_step_complete(&self, step: Step) -> bool {
+        match step {
+            Step::NameDevice => self.name_device_complete,
+            Step::BrowserApproval => self.browser_approval_complete,
+            Step::Finish => false,
+        }
+    }
+
+    pub fn mark_browser_approval_complete(&mut self) {
+        self.browser_approval_complete = true;
     }
 
     pub fn contextual_actions(&self) -> ContextualActions {
@@ -324,5 +343,40 @@ mod tests {
         assert!(!app.contextual_actions().open_browser);
         assert!(!app.contextual_actions().copy_authorization_url);
         assert!(!app.contextual_actions().restart_authorization);
+    }
+
+    #[test]
+    fn navigation_does_not_mark_steps_complete() {
+        let mut app = App::default();
+
+        app.update(Action::MoveStepNext);
+        app.update(Action::MoveStepNext);
+
+        assert_eq!(app.active_step(), Step::Finish);
+        assert!(!app.is_step_complete(Step::NameDevice));
+        assert!(!app.is_step_complete(Step::BrowserApproval));
+    }
+
+    #[test]
+    fn continue_step_only_marks_name_device_complete() {
+        let mut app = App::default();
+
+        app.update(Action::ContinueStep);
+        app.update(Action::ContinueStep);
+
+        assert!(app.is_step_complete(Step::NameDevice));
+        assert!(!app.is_step_complete(Step::BrowserApproval));
+    }
+
+    #[test]
+    fn browser_approval_completion_is_explicit() {
+        let mut app = App::default();
+
+        app.update(Action::ContinueStep);
+        assert!(!app.is_step_complete(Step::BrowserApproval));
+
+        app.mark_browser_approval_complete();
+
+        assert!(app.is_step_complete(Step::BrowserApproval));
     }
 }
