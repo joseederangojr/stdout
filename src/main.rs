@@ -15,7 +15,7 @@ use std::{
 };
 
 use anyhow::{bail, Result};
-use app::{Action, App};
+use app::{Action, App, EnterAction};
 use auth::AuthFlow;
 use config::Config;
 
@@ -118,6 +118,7 @@ fn run_tui(start_login: bool, device_name: Option<String>, config: Config) -> Re
     let had_device_key = AuthFlow::has_device_key(&config);
     let mut auth = AuthFlow::new(config)?;
     let mut app = App::default();
+    app.set_device_name_suggestion(auth.device_name());
     if let Some(warning) = protocol_warning {
         app.set_message(Some(warning));
     }
@@ -146,9 +147,10 @@ fn run_tui(start_login: bool, device_name: Option<String>, config: Config) -> Re
 
         let device_name = match device_name {
             Some(name) => name,
-            None => prompt_device_name(auth.device_name())?,
+            None => prompt_device_name(app.device_name_suggestion())?,
         };
-        match auth.set_device_name(device_name) {
+        app.set_device_name_input(device_name);
+        match auth.set_device_name(app.device_name_input().to_owned()) {
             Ok(()) => match webbrowser::open(auth.authorization_url()) {
                 Ok(()) if app.message().is_none() => app.set_message(Some(
                     "Browser opened. Approve stdout, then return here if the callback does not arrive."
@@ -181,13 +183,15 @@ fn run_tui(start_login: bool, device_name: Option<String>, config: Config) -> Re
             }
         }
 
-        let action = event::read_action(Duration::from_millis(100), app.input_is_empty())?;
+        let action = event::read_action(Duration::from_millis(100), app.mode(), app.active_step())?;
         let Some(action) = action else {
             continue;
         };
 
+        let contextual_actions = app.contextual_actions();
+
         match action {
-            Action::OpenBrowser if username.is_none() => {
+            Action::OpenBrowser if username.is_none() && contextual_actions.open_browser => {
                 match webbrowser::open(auth.authorization_url()) {
                     Ok(()) => app.set_message(Some(
                         "Approve stdout in the browser, then paste its callback URI here."
@@ -196,7 +200,9 @@ fn run_tui(start_login: bool, device_name: Option<String>, config: Config) -> Re
                     Err(error) => app.set_message(Some(format!("Could not open browser: {error}"))),
                 }
             }
-            Action::RestartAuthorization if username.is_none() => {
+            Action::RestartAuthorization
+                if username.is_none() && contextual_actions.restart_authorization =>
+            {
                 match auth.restart() {
                     Ok(()) => app.set_message(Some("New sign-in link ready.".to_owned())),
                     Err(error) => {
@@ -205,7 +211,10 @@ fn run_tui(start_login: bool, device_name: Option<String>, config: Config) -> Re
                 }
                 app.take_callback_input();
             }
-            Action::SubmitCallback if username.is_none() => {
+            Action::SubmitCallback
+                if username.is_none()
+                    && contextual_actions.enter == Some(EnterAction::SubmitCallback) =>
+            {
                 let uri = app.take_callback_input();
                 if uri.trim().is_empty() {
                     app.set_message(Some(
