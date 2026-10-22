@@ -1,23 +1,33 @@
 use std::{io, time::Duration};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::{
+    event::{
+        self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
+    terminal,
+};
 
-use crate::app::{Action, Mode, Step};
+use crate::{
+    app::{Action, Mode, Step},
+    ui,
+};
 
 pub fn read_action(timeout: Duration, mode: Mode, active_step: Step) -> io::Result<Option<Action>> {
     if !event::poll(timeout)? {
         return Ok(None);
     }
 
-    let action = match event::read()? {
-        Event::Paste(value) => action_from_paste(value, mode),
+    match event::read()? {
+        Event::Paste(value) => Ok(action_from_paste(value, mode)),
         Event::Key(key) if key.kind == KeyEventKind::Press => {
-            action_from_key(key.code, key.modifiers, mode, active_step)
+            Ok(action_from_key(key.code, key.modifiers, mode, active_step))
         }
-        _ => None,
-    };
-
-    Ok(action)
+        Event::Mouse(mouse) => {
+            let (width, height) = terminal::size()?;
+            Ok(action_from_mouse(mouse, width, height))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn action_from_key(
@@ -75,6 +85,14 @@ fn action_from_enter(active_step: Step) -> Option<Action> {
     }
 }
 
+fn action_from_mouse(mouse: MouseEvent, width: u16, height: u16) -> Option<Action> {
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        return None;
+    }
+
+    ui::step_at_mouse_position(width, height, mouse.column, mouse.row).map(Action::SelectStep)
+}
+
 fn action_from_paste(value: String, mode: Mode) -> Option<Action> {
     if mode == Mode::Insert {
         Some(Action::Paste(value))
@@ -85,9 +103,9 @@ fn action_from_paste(value: String, mode: Mode) -> Option<Action> {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
-    use super::{action_from_key, action_from_paste};
+    use super::{action_from_key, action_from_mouse, action_from_paste};
     use crate::app::{Action, Mode, Step};
 
     #[test]
@@ -233,5 +251,44 @@ mod tests {
             action_from_paste("devnull://auth/callback".to_owned(), Mode::Normal),
             None
         );
+    }
+
+    #[test]
+    fn left_mouse_down_selects_step_from_centered_rows() {
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 8,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(
+            action_from_mouse(mouse, 80, 24),
+            Some(Action::SelectStep(Step::BrowserApproval))
+        );
+    }
+
+    #[test]
+    fn mouse_outside_step_rows_is_ignored() {
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(action_from_mouse(mouse, 80, 24), None);
+    }
+
+    #[test]
+    fn non_left_click_mouse_event_is_ignored() {
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 10,
+            row: 8,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(action_from_mouse(mouse, 80, 24), None);
     }
 }

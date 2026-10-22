@@ -85,6 +85,7 @@ pub enum Action {
     ContinueStep,
     MoveStepNext,
     MoveStepPrevious,
+    SelectStep(Step),
     SetMode(Mode),
     Backspace,
     Insert(char),
@@ -111,6 +112,10 @@ impl App {
             }
             Action::MoveStepPrevious => {
                 self.active_step = self.active_step.previous();
+            }
+            Action::SelectStep(step) => {
+                self.active_step = step;
+                self.mode = Mode::Visual;
             }
             Action::SetMode(mode) => self.mode = mode,
             Action::Backspace if self.mode == Mode::Insert => match self.active_step {
@@ -294,6 +299,16 @@ mod tests {
         app.update(Action::ContinueStep);
         assert_eq!(app.active_step(), Step::Finish);
         assert_eq!(app.mode(), Mode::Insert);
+    }
+
+    #[test]
+    fn mouse_step_selection_sets_active_step_and_enters_visual_mode() {
+        let mut app = App::default();
+
+        app.update(Action::SelectStep(Step::Finish));
+
+        assert_eq!(app.active_step(), Step::Finish);
+        assert_eq!(app.mode(), Mode::Visual);
     }
 
     #[test]

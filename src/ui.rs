@@ -119,6 +119,69 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
+#[derive(Clone, Copy)]
+struct StepHitTestLayout {
+    stepper_area: Rect,
+    name_row: u16,
+    browser_row: u16,
+    finish_row: u16,
+}
+
+pub(crate) fn step_at_mouse_position(
+    width: u16,
+    height: u16,
+    column: u16,
+    row: u16,
+) -> Option<Step> {
+    let layout = step_hit_test_layout(Rect::new(0, 0, width, height));
+    if !rect_contains(layout.stepper_area, column, row) {
+        return None;
+    }
+
+    if row == layout.name_row {
+        Some(Step::NameDevice)
+    } else if row == layout.browser_row {
+        Some(Step::BrowserApproval)
+    } else if row == layout.finish_row {
+        Some(Step::Finish)
+    } else {
+        None
+    }
+}
+
+fn step_hit_test_layout(area: Rect) -> StepHitTestLayout {
+    let [content_area, _] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+
+    let onboarding_area = centered_rect(
+        content_area,
+        content_area.width.min(ONBOARDING_WIDTH),
+        content_area.height.min(ONBOARDING_HEIGHT),
+    );
+
+    let [_title_area, body_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(onboarding_area);
+    let [steps_area, _details_area] =
+        Layout::horizontal([Constraint::Length(30), Constraint::Min(10)]).areas(body_area);
+    let [_rail_area, labels_area] =
+        Layout::horizontal([Constraint::Length(2), Constraint::Min(8)]).areas(steps_area);
+    let [label_lines_area, _] =
+        Layout::vertical([Constraint::Length(5), Constraint::Min(0)]).areas(labels_area);
+
+    StepHitTestLayout {
+        stepper_area: steps_area,
+        name_row: label_lines_area.y,
+        browser_row: label_lines_area.y.saturating_add(2),
+        finish_row: label_lines_area.y.saturating_add(4),
+    }
+}
+
+fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    let max_x = area.x.saturating_add(area.width);
+    let max_y = area.y.saturating_add(area.height);
+    column >= area.x && column < max_x && row >= area.y && row < max_y
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StepState {
     Complete,
@@ -368,7 +431,7 @@ fn render_divider(frame: &mut Frame<'_>, x: u16, area: Rect) {
 mod tests {
     use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
 
-    use super::{render, View};
+    use super::{render, step_at_mouse_position, View};
     use crate::app::{Mode, Step};
 
     #[test]
@@ -516,6 +579,34 @@ mod tests {
         assert!(lines[23].contains("Esc normal"));
         assert!(!lines[23].contains("j/k"));
         assert!(!lines[23].contains("o open"));
+    }
+
+    #[test]
+    fn step_hit_test_matches_centered_rows() {
+        assert_eq!(
+            step_at_mouse_position(80, 24, 10, 6),
+            Some(Step::NameDevice)
+        );
+        assert_eq!(
+            step_at_mouse_position(80, 24, 10, 8),
+            Some(Step::BrowserApproval)
+        );
+        assert_eq!(step_at_mouse_position(80, 24, 10, 10), Some(Step::Finish));
+    }
+
+    #[test]
+    fn step_hit_test_ignores_outside_stepper_area() {
+        assert_eq!(step_at_mouse_position(80, 24, 1, 6), None);
+        assert_eq!(step_at_mouse_position(80, 24, 10, 7), None);
+    }
+
+    #[test]
+    fn step_hit_test_tracks_resized_terminal_centering() {
+        assert_eq!(
+            step_at_mouse_position(100, 30, 20, 11),
+            Some(Step::BrowserApproval)
+        );
+        assert_eq!(step_at_mouse_position(100, 30, 10, 11), None);
     }
 
     fn render_sign_in_lines(
