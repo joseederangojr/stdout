@@ -402,6 +402,7 @@ mod tests {
         let config = Config {
             api_origin: Url::parse("https://dev-null.sh/").unwrap(),
             dir: dir.clone(),
+            keymap: crate::navigation::Keymap::default(),
         };
         for name in [
             "device_ed25519",
@@ -430,6 +431,7 @@ mod tests {
         let config = Config {
             api_origin: Url::parse("https://dev-null.sh/").unwrap(),
             dir: dir.clone(),
+            keymap: crate::navigation::Keymap::default(),
         };
         let identity = LocalIdentity {
             username: "octocat".to_owned(),
@@ -461,6 +463,7 @@ mod tests {
         let config = Config {
             api_origin: Url::parse("http://localhost:8000/").unwrap(),
             dir: dir.clone(),
+            keymap: crate::navigation::Keymap::default(),
         };
         let mut auth = AuthFlow::new(config).unwrap();
         auth.set_device_name("Work Mac".to_owned()).unwrap();
@@ -487,6 +490,7 @@ mod tests {
         let config = Config {
             api_origin: Url::parse("http://localhost:8000/").unwrap(),
             dir: dir.clone(),
+            keymap: crate::navigation::Keymap::default(),
         };
         let pending = PendingAuthorization {
             state: "s".repeat(43),
